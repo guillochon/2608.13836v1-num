@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -1081,48 +1083,498 @@ class CoxRecurrence {
     const uint32_t vs = g.mul(v, s);
     const int degree = static_cast<int>(g.length[v]) - static_cast<int>(g.length[u]);
     Poly answer = get(us, vs);
-    if (!g.rdesc(u, s)) add_shifted(answer, get(u, vs), 1, degree);
+    if (!g.rdesc(u, s)) add_shifted(answer, get(u, vs), 1, degree);  // shared overflow abort
     memo_.emplace(key, answer);
     return answer;
   }
 };
 
 static const uint64_t H4_Q[] = {0, 1, 8, 67, 234, 326, 220, 78, 14, 1};
+static const uint64_t H4_Q16[] = {0, 1, 7, 52, 124, 120, 55, 12, 1};
+static const char H4_GAETZ_U[] = "2,3,2,1,2,1,4,3,2,1,2,1,3,2,1,2,3,4,3,2,1";
+static const char H4_GAETZ_V[] =
+    "1,2,1,2,3,2,1,2,1,3,2,4,3,2,1,2,1,3,2,1,2,3,4,3,2,1,2,1,3,2,1,2,4,3,2,1,2,3,4";
+static const char H4_LEN16_U[] = "3,2,1,2,1,3,2,4,3,2,1,2,1,3,2,4";
+static const char H4_LEN16_V[] =
+    "2,1,2,3,2,1,2,1,3,2,1,4,3,2,1,2,1,3,2,1,2,4,3,2,1,2,1,3,2,1,4,3";
 
-static int verify_h4_example(const CoxeterGroup& g) {
-  // Gaetz Example 4, generators numbered s1..s4 with m(s1,s2)=5.
-  const int uw[] = {2, 3, 2, 1, 2, 1, 4, 3, 2, 1, 2, 1, 3, 2, 1, 2, 3, 4, 3, 2, 1};
-  const int vw[] = {1, 2, 1, 2, 3, 2, 1, 2, 1, 3, 2, 4, 3, 2, 1, 2, 1, 3, 2, 1, 2,
-                    3, 4, 3, 2, 1, 2, 1, 3, 2, 1, 2, 4, 3, 2, 1, 2, 3, 4};
-  int u0[32], v0[64];
-  const int un = static_cast<int>(sizeof(uw) / sizeof(uw[0]));
-  const int vn = static_cast<int>(sizeof(vw) / sizeof(vw[0]));
-  for (int i = 0; i < un; ++i) u0[i] = uw[i] - 1;
-  for (int i = 0; i < vn; ++i) v0[i] = vw[i] - 1;
-  const uint32_t u = g.word(u0, un);
-  const uint32_t v = g.word(v0, vn);
+static uint32_t cox_word_csv(const CoxeterGroup& g, const std::string& csv) {
+  if (csv.empty() || csv == "e") return 0;
+  int gens[128];
+  int n = 0;
+  std::stringstream ss(csv);
+  std::string tok;
+  while (std::getline(ss, tok, ',')) {
+    if (n >= 128) throw std::runtime_error("coxeter word too long");
+    gens[n++] = std::stoi(tok) - 1;
+  }
+  return g.word(gens, n);
+}
+
+static std::vector<uint64_t> mul_qpoly(const std::vector<uint64_t>& a,
+                                       const std::vector<uint64_t>& b) {
+  std::vector<uint64_t> c(a.size() + b.size() - 1, 0);
+  for (size_t i = 0; i < a.size(); ++i)
+    for (size_t j = 0; j < b.size(); ++j) c[i + j] += a[i] * b[j];
+  return c;
+}
+
+// P(q) = ∏ [d_i]_q with [n]_q = 1+q+...+q^{n-1} (degrees = exponents + 1).
+static bool length_gf_matches(const CoxeterGroup& g, std::initializer_list<int> degrees) {
+  std::vector<uint64_t> P = {1};
+  for (int d : degrees) {
+    if (d < 1) return false;
+    P = mul_qpoly(P, std::vector<uint64_t>(static_cast<size_t>(d), 1));
+  }
+  std::vector<uint64_t> hist(static_cast<size_t>(g.w0_len) + 1, 0);
+  for (uint8_t L : g.length) ++hist[L];
+  if (P.size() != hist.size()) return false;
+  return P == hist;
+}
+
+static bool covering_closure_matches(const CoxeterGroup& g) {
+  const int n = g.n_elt;
+  const int rw = g.row_words;
+  std::vector<uint64_t> clo(static_cast<size_t>(n) * static_cast<size_t>(rw), 0);
+  auto setbit = [&](uint32_t u, uint32_t v) {
+    clo[static_cast<size_t>(v) * static_cast<size_t>(rw) + (u >> 6)] |= 1ull << (u & 63u);
+  };
+  std::vector<std::vector<int>> by_len(static_cast<size_t>(g.w0_len) + 1);
+  for (int i = 0; i < n; ++i) by_len[g.length[static_cast<size_t>(i)]].push_back(i);
+  setbit(0, 0);
+  for (int L = 1; L <= g.w0_len; ++L) {
+    for (int v : by_len[static_cast<size_t>(L)]) {
+      setbit(static_cast<uint32_t>(v), static_cast<uint32_t>(v));
+      for (int u : by_len[static_cast<size_t>(L - 1)]) {
+        if (!g.le(static_cast<uint32_t>(u), static_cast<uint32_t>(v))) continue;
+        const size_t src = static_cast<size_t>(u) * static_cast<size_t>(rw);
+        const size_t dst = static_cast<size_t>(v) * static_cast<size_t>(rw);
+        for (int k = 0; k < rw; ++k) clo[dst + k] |= clo[src + k];
+      }
+    }
+  }
+  return clo == g.below;
+}
+
+static int bruhat_sample_mismatches(const CoxeterGroup& g, int samples, uint64_t seed) {
+  Rng rng(seed);
+  int mm = 0;
+  for (int t = 0; t < samples; ++t) {
+    const uint32_t u = static_cast<uint32_t>(rng.below(static_cast<uint64_t>(g.n_elt)));
+    const uint32_t v = static_cast<uint32_t>(rng.below(static_cast<uint64_t>(g.n_elt)));
+    if (g.le(u, v) != le_recursive(g, u, v)) ++mm;
+  }
+  return mm;
+}
+
+static int show_roundtrip_class(const CoxeterGroup& g, int* as_id, int* as_inv) {
+  *as_id = 0;
+  *as_inv = 0;
+  int other = 0;
+  const int n = std::min(g.n_elt, 400);
+  for (int w = 0; w < n; ++w) {
+    const uint32_t rec = cox_word_csv(g, g.show(static_cast<uint32_t>(w)));
+    if (rec == static_cast<uint32_t>(w)) ++*as_id;
+    else if (rec == g.inv[static_cast<size_t>(w)]) ++*as_inv;
+    else ++other;
+  }
+  return other;
+}
+
+static bool q_equals(const Check& c, const uint64_t* want, int n) {
+  if (c.qn != n) return false;
+  for (int i = 0; i < n; ++i)
+    if (c.q[i] != want[i]) return false;
+  return true;
+}
+
+static void peel_common_rdesc(const CoxeterGroup& g, uint32_t& u, uint32_t& v) {
+  for (;;) {
+    bool progress = false;
+    for (int s = 0; s < g.rank; ++s)
+      if (g.rdesc(u, s) && g.rdesc(v, s)) {
+        u = g.mul(u, s);
+        v = g.mul(v, s);
+        progress = true;
+        break;
+      }
+    if (!progress) break;
+  }
+}
+
+static std::string rdesc_list(const CoxeterGroup& g, uint32_t w) {
+  std::string o;
+  for (int s = 0; s < g.rank; ++s)
+    if (g.rdesc(w, s)) {
+      if (!o.empty()) o += ',';
+      o += std::to_string(s + 1);
+    }
+  return o.empty() ? "-" : o;
+}
+
+static int verify_h4_pair(const CoxeterGroup& g, const char* label, const char* u_csv,
+                          const char* v_csv, const uint64_t* want_q, int qn, int want_d,
+                          int want_at) {
+  const uint32_t u = cox_word_csv(g, u_csv);
+  const uint32_t v = cox_word_csv(g, v_csv);
   const int d = static_cast<int>(g.length[v]) - static_cast<int>(g.length[u]);
   const bool comparable = g.le(u, v);
   const bool rec_le = le_recursive(g, u, v);
   CoxRecurrence rec(g);
   const Check c = inspect_poly(rec.get(u, v), d);
-  bool ok = comparable && rec_le && c.violation && c.qn == 10 && c.at == 2;
-  for (int i = 0; ok && i < 10; ++i) ok = c.q[i] == H4_Q[i];
-  std::cout << "H4 example: comparable=" << comparable << " rec_le=" << rec_le << " u=" << u
+  const std::string show_u = g.show(u);
+  const std::string show_v = g.show(v);
+  uint32_t ur = u, vr = v;
+  peel_common_rdesc(g, ur, vr);
+  const bool reduced = (ur == u && vr == v);
+  const std::string show_ur = g.show(ur), show_vr = g.show(vr);
+  const uint32_t ui = g.inv[u], vi = g.inv[v];
+  bool ok = comparable && rec_le && c.violation && c.at == want_at && d == want_d &&
+            q_equals(c, want_q, qn);
+  std::cout << label << ": comparable=" << comparable << " rec_le=" << rec_le << " ids u=" << u
             << " v=" << v << " length=" << d << " Q=[";
   for (int i = 0; i < c.qn; ++i) {
     if (i) std::cout << ',';
     std::cout << c.q[i];
   }
-  std::cout << "] violation=" << c.violation << " at=" << c.at
-            << "\nH4 example verification: " << (ok ? "PASS" : "FAIL") << '\n';
+  std::cout << "] violation=" << c.violation << " at=" << c.at << "\n  input words u=" << u_csv
+            << " v=" << v_csv << "\n  greedy show u=" << show_u << " v=" << show_v
+            << "\n  rdesc u=[" << rdesc_list(g, u) << "] v=[" << rdesc_list(g, v)
+            << "] already_reduced=" << reduced << "\n  reduced show u=" << show_ur
+            << " v=" << show_vr << "\n  inverse greedy u=" << g.show(ui) << " v=" << g.show(vi)
+            << "\n"
+            << label << " verification: " << (ok ? "PASS" : "FAIL") << '\n';
   return ok ? 0 : 1;
+}
+
+static int verify_h4_example(const CoxeterGroup& g) {
+  return verify_h4_pair(g, "H4 example", H4_GAETZ_U, H4_GAETZ_V, H4_Q, 10, 18, 2);
+}
+
+static int verify_h4_length16(const CoxeterGroup& g) {
+  return verify_h4_pair(g, "H4 length-16", H4_LEN16_U, H4_LEN16_V, H4_Q16, 9, 16, 2);
+}
+
+static bool cert_has_pair(const std::string& path, const char* u_csv, const char* v_csv) {
+  std::ifstream in(path);
+  if (!in) return false;
+  const std::string needle = std::string("u=") + u_csv + " v=" + v_csv + " ";
+  std::string line;
+  while (std::getline(in, line))
+    if (line.find(needle) != std::string::npos) return true;
+  return false;
 }
 
 static int verify_h4() {
   const auto g = make_H4();
   std::cout << "H4 |W|=" << g.n_elt << " ell(w0)=" << g.w0_len << " pos_roots=" << g.n_roots << '\n';
-  return verify_h4_example(g);
+  const bool poin = length_gf_matches(g, {2, 12, 20, 30});
+  std::cout << "H4 Poincaré [2]_q[12]_q[20]_q[30]_q vs length histogram: " << (poin ? "PASS" : "FAIL")
+            << '\n';
+  const bool cov = covering_closure_matches(g);
+  std::cout << "H4 covering-closure equals tabulated Bruhat: " << (cov ? "PASS" : "FAIL") << '\n';
+  const int sample_mm = bruhat_sample_mismatches(g, 8000, 20260824);
+  std::cout << "H4 le vs le_recursive on 8000 random pairs: " << (sample_mm == 0 ? "PASS" : "FAIL")
+            << " mismatches=" << sample_mm << '\n';
+  int rc = 0;
+  if (!poin || !cov || sample_mm) rc = 1;
+  if (verify_h4_example(g) != 0) rc = 1;
+  if (verify_h4_length16(g) != 0) rc = 1;
+  const char* cert = "H4.cert";
+  std::ifstream probe(cert);
+  if (probe) {
+    const uint32_t gu = cox_word_csv(g, H4_GAETZ_U), gv = cox_word_csv(g, H4_GAETZ_V);
+    uint32_t gru = gu, grv = gv;
+    peel_common_rdesc(g, gru, grv);
+    const bool gaetz_paper = cert_has_pair(cert, H4_GAETZ_U, H4_GAETZ_V);
+    const bool gaetz_greedy = cert_has_pair(cert, g.show(gu).c_str(), g.show(gv).c_str());
+    const bool gaetz_reduced = cert_has_pair(cert, g.show(gru).c_str(), g.show(grv).c_str());
+    const bool gaetz_inv = cert_has_pair(cert, g.show(g.inv[gu]).c_str(), g.show(g.inv[gv]).c_str());
+    const uint32_t u16 = cox_word_csv(g, H4_LEN16_U), v16 = cox_word_csv(g, H4_LEN16_V);
+    const bool len16_paper = cert_has_pair(cert, H4_LEN16_U, H4_LEN16_V);
+    const bool len16_greedy = cert_has_pair(cert, g.show(u16).c_str(), g.show(v16).c_str());
+    std::cout << "H4.cert Gaetz paper words: " << (gaetz_paper ? "yes" : "no")
+              << " greedy: " << (gaetz_greedy ? "yes" : "no")
+              << " reduced: " << (gaetz_reduced ? "yes" : "no")
+              << " inverse: " << (gaetz_inv ? "yes" : "no") << '\n';
+    std::cout << "H4.cert length-16 paper words: " << (len16_paper ? "yes" : "no")
+              << " greedy: " << (len16_greedy ? "yes" : "no") << '\n';
+    // The published pair is among the failures if its elements, its reduced pair, or
+    // the inverse pair is recorded (same Q; inversion orbit).
+    if (!gaetz_paper && !gaetz_greedy && !gaetz_reduced && !gaetz_inv) rc = 1;
+    if (!len16_paper && !len16_greedy) rc = 1;
+  } else {
+    std::cout << "H4.cert not on disk (skip pair-in-cert check)\n";
+  }
+  return rc;
+}
+
+static uint64_t pack32(uint32_t u, uint32_t v) {
+  return (static_cast<uint64_t>(u) << 32) | v;
+}
+
+static int coxeter_orbits(const std::string& cert_path, const std::string& summary_path) {
+  std::ifstream in(cert_path);
+  if (!in) throw std::runtime_error("cannot open " + cert_path);
+  const auto g = make_H4();
+  struct Fail {
+    uint32_t u, v;
+    int d;
+    std::string q;
+  };
+  std::vector<Fail> fails;
+  std::unordered_map<uint64_t, size_t> idx;
+  std::string line;
+  int nlines = 0, parse_fail = 0, roundtrip_fail = 0;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    ++nlines;
+    const auto u_pos = line.find("u=");
+    const auto v_pos = line.find(" v=");
+    const auto l_pos = line.find(" length=");
+    const auto q_pos = line.find(" Q=");
+    if (u_pos != 0 && line.rfind("H4 u=", 0) != 0) {
+      ++parse_fail;
+      continue;
+    }
+    if (u_pos == std::string::npos || v_pos == std::string::npos || l_pos == std::string::npos ||
+        q_pos == std::string::npos) {
+      ++parse_fail;
+      continue;
+    }
+    const std::string uword = line.substr(u_pos + 2, v_pos - (u_pos + 2));
+    const std::string vword = line.substr(v_pos + 3, l_pos - (v_pos + 3));
+    const int d = std::stoi(line.substr(l_pos + 8, q_pos - (l_pos + 8)));
+    auto q_end = line.find(']', q_pos);
+    if (q_end == std::string::npos) {
+      ++parse_fail;
+      continue;
+    }
+    const std::string q = line.substr(q_pos + 3, q_end + 1 - (q_pos + 3));
+    // Cert words are show(w), a reduced word for w^{-1}. Map back to the recorded element.
+    const uint32_t u = g.inv[cox_word_csv(g, uword)];
+    const uint32_t v = g.inv[cox_word_csv(g, vword)];
+    if (g.show(u) != uword || g.show(v) != vword) ++roundtrip_fail;
+    const uint64_t key = pack32(u, v);
+    idx[key] = fails.size();
+    fails.push_back({u, v, d, q});
+  }
+
+  int missing_inv = 0, q_mismatch = 0, tau_not_involution = 0, raw_inv_in_set = 0, self_inv = 0;
+  std::map<std::string, std::pair<int, int>> q_stats;
+  std::map<int, int> by_len;
+  auto reduced_inverse = [&](uint32_t u, uint32_t v) {
+    uint32_t a = g.inv[u], b = g.inv[v];
+    peel_common_rdesc(g, a, b);
+    return pack32(a, b);
+  };
+  const int nfail = static_cast<int>(fails.size());
+  std::vector<int> parent(static_cast<size_t>(nfail));
+  for (int i = 0; i < nfail; ++i) parent[static_cast<size_t>(i)] = i;
+  std::function<int(int)> find = [&](int x) {
+    if (parent[static_cast<size_t>(x)] != x)
+      parent[static_cast<size_t>(x)] = find(parent[static_cast<size_t>(x)]);
+    return parent[static_cast<size_t>(x)];
+  };
+  auto unite = [&](int a, int b) {
+    a = find(a);
+    b = find(b);
+    if (a != b) parent[static_cast<size_t>(a)] = b;
+  };
+  for (int i = 0; i < nfail; ++i) {
+    const auto& f = fails[static_cast<size_t>(i)];
+    ++q_stats[f.q].first;
+    if (q_stats[f.q].second == 0 || f.d < q_stats[f.q].second) q_stats[f.q].second = f.d;
+    ++by_len[f.d];
+    const uint64_t raw = pack32(g.inv[f.u], g.inv[f.v]);
+    if (idx.count(raw)) ++raw_inv_in_set;
+    if (raw == pack32(f.u, f.v)) ++self_inv;
+    const uint64_t ip = reduced_inverse(f.u, f.v);
+    const auto it = idx.find(ip);
+    if (it == idx.end()) ++missing_inv;
+    else {
+      if (fails[it->second].q != f.q) ++q_mismatch;
+      if (reduced_inverse(fails[it->second].u, fails[it->second].v) != pack32(f.u, f.v))
+        ++tau_not_involution;
+      unite(i, static_cast<int>(it->second));
+    }
+  }
+  std::map<int, int> comp_sz;
+  std::unordered_map<int, int> root_sz;
+  for (int i = 0; i < nfail; ++i) ++root_sz[find(i)];
+  for (const auto& kv : root_sz) ++comp_sz[kv.second];
+  const int len16 = by_len[16];
+  int orbit1 = 0, orbit2 = 0, orbit_big = 0, orbit_big_pairs = 0;
+  for (const auto& kv : comp_sz) {
+    if (kv.first == 1) orbit1 = kv.second;
+    else if (kv.first == 2) orbit2 = kv.second;
+    else {
+      orbit_big += kv.second;
+      orbit_big_pairs += kv.first * kv.second;
+    }
+  }
+  int len16_raw_closed = 0, len16_self = 0;
+  std::vector<int> p16(static_cast<size_t>(nfail));
+  for (int i = 0; i < nfail; ++i) p16[static_cast<size_t>(i)] = i;
+  std::function<int(int)> find16 = [&](int x) {
+    if (p16[static_cast<size_t>(x)] != x) p16[static_cast<size_t>(x)] = find16(p16[static_cast<size_t>(x)]);
+    return p16[static_cast<size_t>(x)];
+  };
+  auto unite16 = [&](int a, int b) {
+    a = find16(a);
+    b = find16(b);
+    if (a != b) p16[static_cast<size_t>(a)] = b;
+  };
+  for (int i = 0; i < nfail; ++i) {
+    if (fails[static_cast<size_t>(i)].d != 16) continue;
+    const auto& f = fails[static_cast<size_t>(i)];
+    const uint64_t raw = pack32(g.inv[f.u], g.inv[f.v]);
+    if (raw == pack32(f.u, f.v)) ++len16_self;
+    const auto it = idx.find(raw);
+    if (it != idx.end() && fails[it->second].d == 16) {
+      ++len16_raw_closed;
+      unite16(i, static_cast<int>(it->second));
+    }
+  }
+  std::unordered_map<int, int> root16;
+  for (int i = 0; i < nfail; ++i)
+    if (fails[static_cast<size_t>(i)].d == 16) ++root16[find16(i)];
+  int len16_o1 = 0, len16_o2 = 0, len16_obig = 0;
+  for (const auto& kv : root16) {
+    if (kv.second == 1) ++len16_o1;
+    else if (kv.second == 2) ++len16_o2;
+    else ++len16_obig;
+  }
+  const int unpaired = nfail - raw_inv_in_set;
+  const int i_orbit1 = self_inv + unpaired;
+  const int i_orbit2 = (raw_inv_in_set - self_inv) / 2;
+  const int gaetz_copies = q_stats.count("[0,1,8,67,234,326,220,78,14,1]")
+                               ? q_stats["[0,1,8,67,234,326,220,78,14,1]"].first
+                               : 0;
+  const uint32_t gu = cox_word_csv(g, H4_GAETZ_U), gv = cox_word_csv(g, H4_GAETZ_V);
+  uint32_t gru = gu, grv = gv;
+  peel_common_rdesc(g, gru, grv);
+  const bool gaetz_pair = idx.count(pack32(g.inv[gu], g.inv[gv])) > 0;
+  const bool gaetz_reduced = idx.count(pack32(gru, grv)) > 0;
+  const uint32_t u16 = cox_word_csv(g, H4_LEN16_U), v16 = cox_word_csv(g, H4_LEN16_V);
+  const bool len16_pair = idx.count(pack32(u16, v16)) > 0;
+  const bool len16_inv = idx.count(pack32(g.inv[u16], g.inv[v16])) > 0;
+
+  std::ostringstream report;
+  report << "H4 cert " << cert_path << " lines=" << nlines << " parsed=" << fails.size()
+         << " parse_fail=" << parse_fail << " show_roundtrip_fail=" << roundtrip_fail << '\n';
+  report << "unique Q=" << q_stats.size() << " gaetz_Q_copies=" << gaetz_copies
+         << " gaetz_inverse_in_cert=" << gaetz_pair << " gaetz_reduced_in_cert=" << gaetz_reduced
+         << " length16_pair_in_cert=" << len16_pair << " length16_inverse_in_cert=" << len16_inv
+         << '\n';
+  report << "I-orbits on reduced set size1=" << i_orbit1 << " (self=" << self_inv
+         << " unpaired=" << unpaired << ") size2=" << i_orbit2 << " (check "
+         << (i_orbit1 + 2 * i_orbit2) << "==" << nfail << ")\n";
+  report << "components size1=" << orbit1 << " size2=" << orbit2 << " larger=" << orbit_big
+         << " (larger pairs=" << orbit_big_pairs << ")\n";
+  report << "  component-size histogram:";
+  for (const auto& kv : comp_sz) report << " " << kv.first << ":" << kv.second;
+  report << '\n';
+  report << "length-16 pairs=" << len16 << " raw_inverse_in_len16=" << len16_raw_closed
+         << " self=" << len16_self << " I-orbits size1=" << len16_o1 << " size2=" << len16_o2
+         << " larger=" << len16_obig << " (check " << (len16_o1 + 2 * len16_o2) << "==" << len16
+         << ")\n";
+  report << "min-length Qs:\n";
+  for (const auto& kv : q_stats) {
+    if (kv.second.second != 16) continue;
+    report << "  copies=" << kv.second.first << " Q=" << kv.first << '\n';
+  }
+  std::cout << report.str();
+  const bool ok = parse_fail == 0 && roundtrip_fail == 0 && missing_inv == 0 && q_mismatch == 0 &&
+                  (i_orbit1 + 2 * i_orbit2) == nfail && len16_obig == 0 &&
+                  (len16_o1 + 2 * len16_o2) == len16 && gaetz_pair && gaetz_reduced && len16_pair &&
+                  len16_inv && nfail == 20163;
+  std::cout << "H4 orbits check: " << (ok ? "PASS" : "FAIL") << '\n';
+
+  if (!summary_path.empty()) {
+    std::ofstream out(summary_path);
+    if (!out) throw std::runtime_error("cannot write " + summary_path);
+    out << "# H4 census summary\n\n";
+    out << "Regenerate the 20,163-line certificate with\n\n";
+    out << "```sh\nOMP_NUM_THREADS=4 ./brenti_search --coxeter H4 --out H4.cert\n```\n\n";
+    out << "and re-check orbits with `./brenti_search --coxeter-orbits H4.cert --summary "
+           "H4_SUMMARY.md`.\n\n";
+    out << "## Counting convention\n\n";
+    out << "- **intervals** = all comparable pairs \\(u\\le v\\) (including short ones): "
+           "**75,539,433** in \\(H_4\\).\n";
+    out << "- **reduced failures** = comparable, \\(\\ell(v)-\\ell(u)\\ge 4\\), **no common right "
+           "descent**. A shared right descent has the same \\(Q\\) as the strictly shorter pair "
+           "\\((us,vs)\\), which is counted when the reduced upper element is processed (same skip "
+           "as type \\(A\\)).\n";
+    out << "- So **20,163** is the number of reduced failures, not of all intervals.\n\n";
+    out << "## Totals\n\n";
+    out << "| quantity | value |\n|----------|------:|\n";
+    out << "| \\(|W|\\) | 14,400 |\n";
+    out << "| \\(\\ell(w_0)\\) | 60 |\n";
+    out << "| intervals | 75,539,433 |\n";
+    out << "| reduced log-concavity failures | 20,163 |\n";
+    out << "| distinct \\(Q\\)-vectors | " << q_stats.size() << " |\n";
+    out << "| unimodal / internal-zero failures | 0 / 0 |\n";
+    out << "| violation index | 2 in every failure |\n";
+    out << "| min relative length | 16 |\n";
+    out << "| Gaetz Example 4 \\(Q\\) copies | " << gaetz_copies << " |\n";
+    out << "| self-inverse reduced pairs | " << self_inv << " |\n";
+    out << "| reduced pairs whose inverse is also reduced | " << raw_inv_in_set << " |\n";
+    out << "| inversion orbits of size 1 on the reduced set | " << i_orbit1 << " |\n";
+    out << "| inversion orbits of size 2 on the reduced set | " << i_orbit2 << " |\n\n";
+    out << "Every reduced failure's right-reduced inverse is a reduced failure with the same "
+           "\\(Q\\). In \\(H_4\\), \\(w_0\\) is central, so conjugation by \\(w_0\\) is trivial. "
+           "The involution \\((u,v)\\mapsto(u^{-1},v^{-1})\\) preserves \\(Q\\) but does not "
+           "preserve the right-reduced subset: "
+        << unpaired
+        << " inverses share a right descent, so they are counted in reduced form rather than as a "
+           "second copy. On the reduced set this gives "
+        << i_orbit1 << " orbits of size 1 (" << self_inv << " truly self-inverse, " << unpaired
+        << " unpaired) and " << i_orbit2 << " of size 2, accounting for all 20,163. The odd total "
+           "comes from the odd number of size-1 orbits.\n\n";
+    out << "## Minimum length (relative length 16)\n\n";
+    out << len16 << " reduced failures. The raw inversion map closes this slice ("
+        << len16_raw_closed << " of " << len16
+        << " inverses are already right-reduced and still length 16), with " << len16_self
+        << " self-inverse pair" << (len16_self == 1 ? "" : "s") << ", " << len16_o1
+        << " orbit" << (len16_o1 == 1 ? "" : "s") << " of size 1 and " << len16_o2
+        << " of size 2 (" << len16_o1 << " + 2×" << len16_o2 << " = "
+        << (len16_o1 + 2 * len16_o2) << ").\n\n";
+    out << "| copies | \\(Q\\) (ascending) |\n|-------:|-------------------|\n";
+    for (const auto& kv : q_stats) {
+      if (kv.second.second != 16) continue;
+      out << "| " << kv.second.first << " | `" << kv.first << "` |\n";
+    }
+    out << "\nOne explicit length-16 pair, as reduced words (left-to-right product; this pair "
+           "is reduced and both it and its inverse appear in `H4.cert`):\n\n";
+    out << "```\nu = " << H4_LEN16_U << "\nv = " << H4_LEN16_V
+        << "\nQ = [0,1,7,52,124,120,55,12,1]   (7^2=49<52)\n```\n\n";
+    out << "## Gaetz Example 4\n\n";
+    out << "Multiplying the published reduced words (left to right, \\(s_1,\\ldots,s_4\\) with "
+           "\\(m(s_1,s_2)=5\\)) recovers a comparable pair of relative length 18 with the published "
+           "\\(Q\\). That pair **shares the right descent** \\(s_4\\), so it is not itself one of the "
+           "20,163 reduced failures; the enumerator records the equivalent pair with common right "
+           "descents peeled, which has the same \\(Q\\).\n\n";
+    out << "Certificate words are the greedy first-right-descent peeling, which is a reduced word "
+           "for the **inverse** element. Consequently the published words appear verbatim in "
+           "`H4.cert` as the encoding of the inverse pair \\((u^{-1},v^{-1})\\), which *is* reduced "
+           "and is one of the 10 intervals with this \\(Q\\):\n\n";
+    out << "```\nu = " << H4_GAETZ_U << "\nv = " << H4_GAETZ_V
+        << "\nlength = 18\nQ = [0,1,8,67,234,326,220,78,14,1]   (8^2=64<67)\n```\n\n";
+    out << "Gaetz inverse pair in cert: " << (gaetz_pair ? "yes" : "no")
+        << "; right-reduced pair in cert: " << (gaetz_reduced ? "yes" : "no") << ". That \\(Q\\) "
+           "occurs for "
+        << gaetz_copies << " reduced intervals.\n\n";
+    out << "## Failures by relative length\n\n";
+    out << "| length | reduced failures |\n|-------:|-----------------:|\n";
+    for (const auto& kv : by_len) out << "| " << kv.first << " | " << kv.second << " |\n";
+    out << "\n## Poincaré check\n\n";
+    out << "Exponents of \\(H_4\\) are 1, 11, 19, 29, so the length generating function is "
+           "\\(P(q)=[2]_q[12]_q[20]_q[30]_q\\) with \\([n]_q=1+q+\\cdots+q^{n-1}\\). The histogram "
+           "of the 14,400 enumerated lengths matches this polynomial "
+        << (length_gf_matches(g, {2, 12, 20, 30}) ? "(PASS)" : "(FAIL)") << ".\n";
+  }
+  return ok ? 0 : 1;
 }
 
 static int coxeter_exhaustive(const std::string& type, const std::string& output) {
@@ -1277,15 +1729,43 @@ static int self_test() {
       }
     }
     expect(compared_h3 > 0 && poly_mm == 0, "H3 first vs last right-descent R-tilde");
+    expect(covering_closure_matches(h3), "H3 covering-closure equals tabulated Bruhat");
+    expect(length_gf_matches(h3, {2, 6, 10}), "H3 Poincaré [2]_q[6]_q[10]_q");
+    int show_id = 0, show_inv = 0;
+    const int show_other = show_roundtrip_class(h3, &show_id, &show_inv);
+    std::cout << "  H3 show() roundtrip as_id=" << show_id << " as_inv=" << show_inv
+              << " other=" << show_other << '\n';
+    expect(show_other == 0 && show_id + show_inv == std::min(h3.n_elt, 400),
+           "H3 show() is a reduced word for w^{-1}");
+    {
+      Poly dst, src;
+      src.a[0] = 1;
+      dst.a[0] = std::numeric_limits<uint64_t>::max();
+      bool threw = false;
+      try {
+        add_shifted(dst, src, 0, 0);
+      } catch (const std::overflow_error&) {
+        threw = true;
+      }
+      expect(threw, "add_shifted aborts on uint64 overflow");
+    }
     const auto b2 = make_B(2);
     expect(b2.n_elt == 8 && b2.w0_len == 4, "B2 |W|=8 ell(w0)=4");
+    expect(length_gf_matches(b2, {2, 4}), "B2 Poincaré [2]_q[4]_q");
     const auto b3 = make_B(3);
     expect(b3.n_elt == 48 && b3.w0_len == 9, "B3 |W|=48 ell(w0)=9");
+    expect(length_gf_matches(b3, {2, 4, 6}), "B3 Poincaré [2]_q[4]_q[6]_q");
     const auto f4 = make_F4();
     expect(f4.n_elt == 1152 && f4.w0_len == 24, "F4 |W|=1152 ell(w0)=24");
+    expect(length_gf_matches(f4, {2, 6, 8, 12}), "F4 Poincaré [2]_q[6]_q[8]_q[12]_q");
     const auto h4 = make_H4();
     expect(h4.n_elt == 14400 && h4.w0_len == 60, "H4 |W|=14400 ell(w0)=60");
+    expect(length_gf_matches(h4, {2, 12, 20, 30}), "H4 Poincaré [2]_q[12]_q[20]_q[30]_q");
+    expect(covering_closure_matches(h4), "H4 covering-closure equals tabulated Bruhat");
+    expect(bruhat_sample_mismatches(h4, 8000, 20260824) == 0,
+           "H4 le vs le_recursive on 8000 random pairs");
     expect(verify_h4_example(h4) == 0, "H4 Gaetz example");
+    expect(verify_h4_length16(h4) == 0, "H4 length-16 example");
   } catch (const std::exception& e) {
     std::cout << "FAIL Coxeter build: " << e.what() << '\n';
     ++fails;
@@ -1321,6 +1801,7 @@ static void usage() {
       "usage: brenti_search --verify-s14 | --verify-h4 | --self-test |\n"
       "                     --exhaustive N [--out FILE] [--checkpoint FILE] [--symmetry] |\n"
       "                     --coxeter TYPE [--out FILE] |\n"
+      "                     --coxeter-orbits FILE [--summary FILE] |\n"
       "                     --eval U V | --flatten [--out FILE] | --explore [LIMIT] [--out FILE] |\n"
       "                     --hunt [SAMPLES] [--out FILE] [--seed N]\n"
       "       TYPE is one of H3,H4,F4,B2,B3,B4,B5,ALL");
@@ -1333,6 +1814,15 @@ int main(int argc, char** argv) {
     if (cmd == "--verify-s14" || cmd == "--verify-s14") return verify_s14();
     if (cmd == "--verify-h4") return verify_h4();
     if (cmd == "--self-test") return self_test();
+    if (cmd == "--coxeter-orbits") {
+      if (argc < 3) usage();
+      std::string summary;
+      for (int i = 3; i < argc; ++i) {
+        if (std::string(argv[i]) == "--summary" && i + 1 < argc) summary = argv[++i];
+        else usage();
+      }
+      return coxeter_orbits(argv[2], summary);
+    }
     if (cmd == "--coxeter") {
       if (argc < 3) usage();
       std::string output;

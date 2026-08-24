@@ -129,6 +129,7 @@ struct CoxeterGroup {
   std::vector<uint8_t> length;
   std::vector<std::array<uint32_t, COX_RMAX>> rs;
   std::vector<uint64_t> inv_lo, inv_hi;
+  std::vector<uint32_t> inv;  // inv[w] = w^{-1}
   std::vector<CVec> proot;
   int row_words = 0;
   std::vector<uint64_t> below;
@@ -154,6 +155,8 @@ struct CoxeterGroup {
     for (int i = 0; i < n; ++i) w = mul(w, gens[i]);
     return w;
   }
+  // First-right-descent peeling: w * s0 * s1 * ... = 1, so the printed word is reduced
+  // for w^{-1}. Certificate lines use this encoding; multiplying a cert word recovers w^{-1}.
   std::string show(uint32_t w) const {
     if (w == 0) return "e";
     std::string o;
@@ -269,17 +272,17 @@ inline void build_inversions(CoxeterGroup& g) {
   if (g.n_roots != g.w0_len)
     throw std::runtime_error(g.name + ": n_roots=" + std::to_string(g.n_roots) +
                              " != ell(w0)=" + std::to_string(g.w0_len));
-  std::vector<uint32_t> inv_elt(static_cast<size_t>(g.n_elt));
+  g.inv.resize(static_cast<size_t>(g.n_elt));
   for (int w = 0; w < g.n_elt; ++w)
-    inv_elt[static_cast<size_t>(w)] = inverse_of(g, static_cast<uint32_t>(w));
+    g.inv[static_cast<size_t>(w)] = inverse_of(g, static_cast<uint32_t>(w));
   for (int w = 0; w < g.n_elt; ++w)
-    if (inv_elt[inv_elt[static_cast<size_t>(w)]] != static_cast<uint32_t>(w))
+    if (g.inv[g.inv[static_cast<size_t>(w)]] != static_cast<uint32_t>(w))
       throw std::runtime_error(g.name + ": inverse is not an involution at " + std::to_string(w));
   g.inv_lo.assign(static_cast<size_t>(g.n_elt), 0);
   g.inv_hi.assign(static_cast<size_t>(g.n_elt), 0);
   for (int w = 0; w < g.n_elt; ++w) {
     uint64_t lo = 0, hi = 0;
-    const CMat& winv = g.elt[inv_elt[static_cast<size_t>(w)]];
+    const CMat& winv = g.elt[g.inv[static_cast<size_t>(w)]];
     for (int r = 0; r < g.n_roots; ++r) {
       const CVec im = cmat_apply(winv, g.proot[static_cast<size_t>(r)]);
       if (cvec_pos(im)) continue;
