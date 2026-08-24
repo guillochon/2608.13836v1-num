@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -14,6 +15,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "coxeter.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -85,6 +88,37 @@ static Perm reverse_diagram(Perm p) {
   Perm q = 0;
   for (int i = 0; i < N; ++i) q = put(q, i, N + 1 - val(p, N - 1 - i));
   return q;
+}
+
+static Perm orbit_min_upper(Perm v) {
+  const Perm a = v;
+  const Perm b = inverse(v);
+  const Perm c = reverse_diagram(v);
+  const Perm d = reverse_diagram(b);
+  return std::min(std::min(a, b), std::min(c, d));
+}
+
+static bool canonical_upper(Perm v) { return v == orbit_min_upper(v); }
+
+static Perm mul_left(Perm p, int s) {
+  Perm q = 0;
+  for (int i = 0; i < N; ++i) {
+    int x = val(p, i);
+    if (x == s + 1) x = s + 2;
+    else if (x == s + 2) x = s + 1;
+    q = put(q, i, x);
+  }
+  return q;
+}
+
+static bool left_descent(Perm p, int s) {
+  int p1 = -1, p2 = -1;
+  for (int i = 0; i < N; ++i) {
+    const int x = val(p, i);
+    if (x == s + 1) p1 = i;
+    if (x == s + 2) p2 = i;
+  }
+  return p1 > p2;
 }
 
 static bool bruhat(Perm u, Perm v) {
@@ -206,21 +240,55 @@ class Recurrence {
   }
 };
 
+class LeftRecurrence {
+  std::unordered_map<Key, Poly, KeyHash> memo_;
+
+ public:
+  Poly get(Perm u, Perm v) {
+    const Key key{u, v};
+    const auto found = memo_.find(key);
+    if (found != memo_.end()) return found->second;
+    if (u == v) {
+      Poly one;
+      one.a[0] = 1;
+      memo_.emplace(key, one);
+      return one;
+    }
+    if (!bruhat(u, v)) {
+      Poly zero;
+      memo_.emplace(key, zero);
+      return zero;
+    }
+    int s = -1;
+    for (int i = 0; i + 1 < N; ++i) {
+      if (left_descent(v, i)) {
+        s = i;
+        break;
+      }
+    }
+    if (s < 0) throw std::logic_error("missing left descent");
+    const Perm su = mul_left(u, s);
+    const Perm sv = mul_left(v, s);
+    const int degree = length(v) - length(u);
+    Poly answer = get(su, sv);
+    if (!left_descent(u, s)) add_shifted(answer, get(u, sv), 1, degree);
+    memo_.emplace(key, answer);
+    return answer;
+  }
+};
+
 struct Check {
   bool violation = false;
+  bool unimodal_fail = false;
+  bool internal_zero = false;
   int at = -1;
   int d = 0;
   int qn = 0;
   uint64_t q[MAX_DEG / 2 + 2]{};
 };
 
-static Check inspect(Perm u, Perm v, const Poly& p) {
-  Check c;
-  c.d = length(v) - length(u);
-  int k = 0;
-  for (int exponent = c.d & 1; exponent <= c.d; exponent += 2) c.q[k++] = p.a[exponent];
-  c.qn = k;
-  for (int i = 1; i + 1 < k; ++i) {
+static void finish_check(Check& c) {
+  for (int i = 1; i + 1 < c.qn; ++i) {
     if (static_cast<__uint128_t>(c.q[i]) * c.q[i] <
         static_cast<__uint128_t>(c.q[i - 1]) * c.q[i + 1]) {
       c.violation = true;
@@ -228,7 +296,31 @@ static Check inspect(Perm u, Perm v, const Poly& p) {
       break;
     }
   }
+  int first = 0, last = c.qn - 1;
+  while (first < c.qn && c.q[first] == 0) ++first;
+  while (last >= 0 && c.q[last] == 0) --last;
+  for (int i = first; i <= last; ++i)
+    if (c.q[i] == 0) c.internal_zero = true;
+  if (last > first) {
+    int i = first;
+    while (i < last && c.q[i] <= c.q[i + 1]) ++i;
+    while (i < last && c.q[i] >= c.q[i + 1]) ++i;
+    c.unimodal_fail = i != last;
+  }
+}
+
+static Check inspect_poly(const Poly& p, int d) {
+  Check c;
+  c.d = d;
+  int k = 0;
+  for (int exponent = d & 1; exponent <= d; exponent += 2) c.q[k++] = p.a[exponent];
+  c.qn = k;
+  finish_check(c);
   return c;
+}
+
+static Check inspect(Perm u, Perm v, const Poly& p) {
+  return inspect_poly(p, length(v) - length(u));
 }
 
 static std::string cert_line(Perm u, Perm v, const Check& c) {
@@ -478,7 +570,7 @@ static void consider_near(Near& best, const Check& c, Perm u, Perm v) {
   }
 }
 
-static int exhaustive(int n, const std::string& output, const std::string& checkpoint) {
+static int exhaustive(int n, const std::string& output, const std::string& checkpoint, bool symmetry) {
   N = n;
   std::unordered_set<uint64_t> done;
   if (!checkpoint.empty()) {
@@ -495,14 +587,25 @@ static int exhaustive(int n, const std::string& output, const std::string& check
   }
 
   std::mutex io_mutex;
-  std::atomic<uint64_t> intervals{0}, violations{0}, completed{0};
+  std::atomic<uint64_t> intervals{0}, violations{0}, completed{0}, skipped_sym{0};
+  std::atomic<uint64_t> unimodal_fails{0}, internal_zeros{0};
+  std::atomic<int> min_fail_d{1000};
   const uint64_t total = factorial(N);
+  const auto t0 = std::chrono::steady_clock::now();
+  std::cout << std::unitbuf;
+  if (symmetry) std::cout << "symmetry quotient: inverse + diagram reversal on upper element\n";
 #pragma omp parallel for schedule(dynamic, 1)
   for (uint64_t v_rank = 0; v_rank < total; ++v_rank) {
     if (done.find(v_rank) != done.end()) continue;
     const Perm v = at_rank(v_rank);
+    if (symmetry && !canonical_upper(v)) {
+      ++skipped_sym;
+      ++completed;
+      continue;
+    }
     Recurrence recurrence;
-    uint64_t local_intervals = 0, local_violations = 0;
+    uint64_t local_intervals = 0, local_violations = 0, local_uni = 0, local_iz = 0;
+    int local_min_d = 1000;
     std::unordered_set<Perm> seen;
     std::vector<Perm> stack;
     seen.insert(v);
@@ -522,20 +625,33 @@ static int exhaustive(int n, const std::string& output, const std::string& check
           }
       }
       if (du >= 4 && !share_desc) {
-        std::ostringstream line;
-        if (report(u, v, recurrence.get(u, v), line)) {
+        const Poly poly = recurrence.get(u, v);
+        const Check c = inspect(u, v, poly);
+        if (c.unimodal_fail) ++local_uni;
+        if (c.internal_zero) ++local_iz;
+        if (c.violation) {
           ++local_violations;
+          local_min_d = std::min(local_min_d, c.d);
+          std::ostringstream line;
+          line << cert_line(u, v, c);
           std::lock_guard<std::mutex> lock(io_mutex);
           certificate << line.str();
           certificate.flush();
         }
       }
-      const int c = down_covers(u, covers, MAX_N * MAX_N);
-      for (int i = 0; i < c; ++i)
+      const int cov = down_covers(u, covers, MAX_N * MAX_N);
+      for (int i = 0; i < cov; ++i)
         if (seen.insert(covers[i]).second) stack.push_back(covers[i]);
     }
     intervals += local_intervals;
     violations += local_violations;
+    unimodal_fails += local_uni;
+    internal_zeros += local_iz;
+    if (local_min_d < min_fail_d.load()) {
+      int old = min_fail_d.load();
+      while (local_min_d < old && !min_fail_d.compare_exchange_weak(old, local_min_d)) {
+      }
+    }
     ++completed;
     if (!checkpoint.empty()) {
       std::lock_guard<std::mutex> lock(io_mutex);
@@ -543,9 +659,13 @@ static int exhaustive(int n, const std::string& output, const std::string& check
       if (completed.load() % 32 == 0) checkpoint_file.flush();
     }
     if (completed.load() % 2000 == 0) {
+      const double sec =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      const uint64_t iv = intervals.load();
       std::lock_guard<std::mutex> lock(io_mutex);
-      std::cout << "progress v=" << completed.load() << "/" << total << " intervals=" << intervals
-                << " violations=" << violations << std::endl;
+      std::cout << "progress v=" << completed.load() << "/" << total << " intervals=" << iv
+                << " violations=" << violations << " skipped_sym=" << skipped_sym << " sec=" << sec
+                << " iv/s=" << (sec > 0 ? iv / sec : 0) << std::endl;
     }
   }
   if (!checkpoint.empty()) {
@@ -553,7 +673,10 @@ static int exhaustive(int n, const std::string& output, const std::string& check
     checkpoint_file.flush();
   }
   std::cout << "completed v indices: " << completed << " / " << total << "; intervals=" << intervals
-            << " violations=" << violations << '\n';
+            << " violations=" << violations << " skipped_sym=" << skipped_sym
+            << " unimodal_fails=" << unimodal_fails << " internal_zeros=" << internal_zeros;
+  if (violations.load()) std::cout << " min_fail_d=" << min_fail_d.load();
+  std::cout << '\n';
   return 0;
 }
 
@@ -923,11 +1046,284 @@ static int hunt(uint64_t samples, uint64_t seed, const std::string& output) {
   return 0;
 }
 
+static Poly cox_zero_poly() { return Poly{}; }
+
+class CoxRecurrence {
+  const CoxeterGroup& g;
+  const bool last_desc;
+  std::unordered_map<uint64_t, Poly> memo_;
+
+  static uint64_t pack(uint32_t u, uint32_t v) {
+    return (static_cast<uint64_t>(u) << 32) | v;
+  }
+
+ public:
+  explicit CoxRecurrence(const CoxeterGroup& gg, bool last = false) : g(gg), last_desc(last) {}
+
+  Poly get(uint32_t u, uint32_t v) {
+    const uint64_t key = pack(u, v);
+    const auto found = memo_.find(key);
+    if (found != memo_.end()) return found->second;
+    if (u == v) {
+      Poly one;
+      one.a[0] = 1;
+      memo_.emplace(key, one);
+      return one;
+    }
+    if (!g.le(u, v)) {
+      Poly z;
+      memo_.emplace(key, z);
+      return z;
+    }
+    const int s = last_desc ? g.last_rdesc(v) : g.first_rdesc(v);
+    if (s < 0) throw std::logic_error("nonidentity without right descent");
+    const uint32_t us = g.mul(u, s);
+    const uint32_t vs = g.mul(v, s);
+    const int degree = static_cast<int>(g.length[v]) - static_cast<int>(g.length[u]);
+    Poly answer = get(us, vs);
+    if (!g.rdesc(u, s)) add_shifted(answer, get(u, vs), 1, degree);
+    memo_.emplace(key, answer);
+    return answer;
+  }
+};
+
+static const uint64_t H4_Q[] = {0, 1, 8, 67, 234, 326, 220, 78, 14, 1};
+
+static int verify_h4_example(const CoxeterGroup& g) {
+  // Gaetz Example 4, generators numbered s1..s4 with m(s1,s2)=5.
+  const int uw[] = {2, 3, 2, 1, 2, 1, 4, 3, 2, 1, 2, 1, 3, 2, 1, 2, 3, 4, 3, 2, 1};
+  const int vw[] = {1, 2, 1, 2, 3, 2, 1, 2, 1, 3, 2, 4, 3, 2, 1, 2, 1, 3, 2, 1, 2,
+                    3, 4, 3, 2, 1, 2, 1, 3, 2, 1, 2, 4, 3, 2, 1, 2, 3, 4};
+  int u0[32], v0[64];
+  const int un = static_cast<int>(sizeof(uw) / sizeof(uw[0]));
+  const int vn = static_cast<int>(sizeof(vw) / sizeof(vw[0]));
+  for (int i = 0; i < un; ++i) u0[i] = uw[i] - 1;
+  for (int i = 0; i < vn; ++i) v0[i] = vw[i] - 1;
+  const uint32_t u = g.word(u0, un);
+  const uint32_t v = g.word(v0, vn);
+  const int d = static_cast<int>(g.length[v]) - static_cast<int>(g.length[u]);
+  const bool comparable = g.le(u, v);
+  const bool rec_le = le_recursive(g, u, v);
+  CoxRecurrence rec(g);
+  const Check c = inspect_poly(rec.get(u, v), d);
+  bool ok = comparable && rec_le && c.violation && c.qn == 10 && c.at == 2;
+  for (int i = 0; ok && i < 10; ++i) ok = c.q[i] == H4_Q[i];
+  std::cout << "H4 example: comparable=" << comparable << " rec_le=" << rec_le << " u=" << u
+            << " v=" << v << " length=" << d << " Q=[";
+  for (int i = 0; i < c.qn; ++i) {
+    if (i) std::cout << ',';
+    std::cout << c.q[i];
+  }
+  std::cout << "] violation=" << c.violation << " at=" << c.at
+            << "\nH4 example verification: " << (ok ? "PASS" : "FAIL") << '\n';
+  return ok ? 0 : 1;
+}
+
+static int verify_h4() {
+  const auto g = make_H4();
+  std::cout << "H4 |W|=" << g.n_elt << " ell(w0)=" << g.w0_len << " pos_roots=" << g.n_roots << '\n';
+  return verify_h4_example(g);
+}
+
+static int coxeter_exhaustive(const std::string& type, const std::string& output) {
+  if (type == "ALL") {
+    const char* types[] = {"H3", "B2", "B3", "B4", "B5", "F4", "H4"};
+    for (const char* t : types) {
+      const std::string out = output.empty() ? std::string(t) + ".cert" : output;
+      if (coxeter_exhaustive(t, out) != 0) return 1;
+    }
+    return 0;
+  }
+  CoxeterGroup g;
+  if (type == "H3") g = make_H3();
+  else if (type == "H4") g = make_H4();
+  else if (type == "F4") g = make_F4();
+  else if (type == "B2") g = make_B(2);
+  else if (type == "B3") g = make_B(3);
+  else if (type == "B4") g = make_B(4);
+  else if (type == "B5") g = make_B(5);
+  else throw std::runtime_error("unknown Coxeter type (try H3,H4,F4,B2,B3,B4,B5)");
+
+  std::cout << std::unitbuf;
+  std::cout << type << " |W|=" << g.n_elt << " ell(w0)=" << g.w0_len << " pos_roots=" << g.n_roots
+            << '\n';
+  if (type == "H4" && verify_h4_example(g) != 0) return 1;
+
+  std::ofstream certificate;
+  if (!output.empty()) {
+    certificate.open(output, std::ios::app);
+    if (!certificate) throw std::runtime_error("cannot open output file");
+  }
+  std::mutex io_mutex;
+  std::atomic<uint64_t> intervals{0}, violations{0}, unimodal_fails{0}, internal_zeros{0};
+  std::atomic<uint64_t> gaetz_q{0};
+  std::atomic<int> min_fail_d{1000};
+  const int n_elt = g.n_elt;
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int v = 0; v < n_elt; ++v) {
+    CoxRecurrence rec(g);
+    uint64_t local_int = 0, local_vi = 0, local_uni = 0, local_iz = 0;
+    int local_min = 1000;
+    for (int u = 0; u < n_elt; ++u) {
+      if (!g.le(static_cast<uint32_t>(u), static_cast<uint32_t>(v))) continue;
+      ++local_int;
+      const int du = static_cast<int>(g.length[static_cast<size_t>(v)]) -
+                     static_cast<int>(g.length[static_cast<size_t>(u)]);
+      if (du < 4) continue;
+      bool share = false;
+      for (int s = 0; s < g.rank; ++s)
+        if (g.rdesc(static_cast<uint32_t>(u), s) && g.rdesc(static_cast<uint32_t>(v), s)) {
+          share = true;
+          break;
+        }
+      if (share) continue;
+      const Check c = inspect_poly(rec.get(static_cast<uint32_t>(u), static_cast<uint32_t>(v)), du);
+      if (c.unimodal_fail) ++local_uni;
+      if (c.internal_zero) ++local_iz;
+      if (c.violation) {
+        ++local_vi;
+        local_min = std::min(local_min, c.d);
+        if (type == "H4" && c.qn == 10) {
+          bool same = true;
+          for (int i = 0; i < 10; ++i)
+            if (c.q[i] != H4_Q[i]) same = false;
+          if (same) ++gaetz_q;
+        }
+        if (certificate.is_open()) {
+          std::ostringstream line;
+          line << type << " u=" << g.show(static_cast<uint32_t>(u))
+               << " v=" << g.show(static_cast<uint32_t>(v)) << " length=" << c.d << " Q=[";
+          for (int j = 0; j < c.qn; ++j) {
+            if (j) line << ',';
+            line << c.q[j];
+          }
+          line << "] violation_at=" << c.at << '\n';
+          std::lock_guard<std::mutex> lock(io_mutex);
+          certificate << line.str();
+          certificate.flush();
+        }
+      }
+    }
+    intervals += local_int;
+    violations += local_vi;
+    unimodal_fails += local_uni;
+    internal_zeros += local_iz;
+    if (local_min < min_fail_d.load()) {
+      int old = min_fail_d.load();
+      while (local_min < old && !min_fail_d.compare_exchange_weak(old, local_min)) {
+      }
+    }
+    if ((v & 255) == 0) {
+      std::lock_guard<std::mutex> lock(io_mutex);
+      std::cout << type << " progress v=" << v << "/" << n_elt << " intervals=" << intervals
+                << " violations=" << violations << std::endl;
+    }
+  }
+  std::cout << type << " done intervals=" << intervals << " Q-logconcave-fails=" << violations
+            << " unimodal_fails=" << unimodal_fails << " internal_zeros=" << internal_zeros;
+  if (violations.load()) std::cout << " min_fail_d=" << min_fail_d.load();
+  if (type == "H4") std::cout << " gaetz_Q_copies=" << gaetz_q.load();
+  std::cout << '\n';
+  return 0;
+}
+
+static int self_test() {
+  std::cout << std::unitbuf;
+  int fails = 0;
+  auto expect = [&](bool ok, const char* msg) {
+    std::cout << (ok ? "ok  " : "FAIL ") << msg << '\n';
+    if (!ok) ++fails;
+  };
+  try {
+    const auto h3 = make_H3();
+    expect(h3.n_elt == 120 && h3.w0_len == 15, "H3 |W|=120 ell(w0)=15");
+    int bruhat_mm = 0, inv_only = 0, rec_only = 0;
+    int first_u = -1, first_v = -1;
+    for (int u = 0; u < h3.n_elt; ++u)
+      for (int v = 0; v < h3.n_elt; ++v) {
+        const bool inv = h3.le(static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+        const bool rec = le_recursive(h3, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+        if (inv != rec) {
+          ++bruhat_mm;
+          if (inv && !rec) ++inv_only;
+          if (!inv && rec) ++rec_only;
+          if (first_u < 0) {
+            first_u = u;
+            first_v = v;
+          }
+        }
+      }
+    if (first_u >= 0)
+      std::cout << "  first H3 mismatch u=" << first_u << " v=" << first_v
+                << " len(u)=" << static_cast<int>(h3.length[static_cast<size_t>(first_u)])
+                << " len(v)=" << static_cast<int>(h3.length[static_cast<size_t>(first_v)])
+                << " inv=" << h3.le(static_cast<uint32_t>(first_u), static_cast<uint32_t>(first_v))
+                << " rec=" << le_recursive(h3, static_cast<uint32_t>(first_u), static_cast<uint32_t>(first_v))
+                << " inv_only=" << inv_only << " rec_only=" << rec_only << '\n';
+    expect(bruhat_mm == 0, "H3 inversion Bruhat equals recursive descent");
+    CoxRecurrence first(h3), last(h3, true);
+    int poly_mm = 0, compared_h3 = 0;
+    for (int v = 0; v < h3.n_elt; ++v) {
+      for (int u = 0; u < h3.n_elt; ++u) {
+        if (!h3.le(static_cast<uint32_t>(u), static_cast<uint32_t>(v))) continue;
+        const Poly a = first.get(static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+        const Poly b = last.get(static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+        ++compared_h3;
+        for (int i = 0; i <= MAX_DEG; ++i)
+          if (a.a[i] != b.a[i]) {
+            ++poly_mm;
+            break;
+          }
+      }
+    }
+    expect(compared_h3 > 0 && poly_mm == 0, "H3 first vs last right-descent R-tilde");
+    const auto b2 = make_B(2);
+    expect(b2.n_elt == 8 && b2.w0_len == 4, "B2 |W|=8 ell(w0)=4");
+    const auto b3 = make_B(3);
+    expect(b3.n_elt == 48 && b3.w0_len == 9, "B3 |W|=48 ell(w0)=9");
+    const auto f4 = make_F4();
+    expect(f4.n_elt == 1152 && f4.w0_len == 24, "F4 |W|=1152 ell(w0)=24");
+    const auto h4 = make_H4();
+    expect(h4.n_elt == 14400 && h4.w0_len == 60, "H4 |W|=14400 ell(w0)=60");
+    expect(verify_h4_example(h4) == 0, "H4 Gaetz example");
+  } catch (const std::exception& e) {
+    std::cout << "FAIL Coxeter build: " << e.what() << '\n';
+    ++fails;
+  }
+
+  N = 7;
+  Rng rng(42);
+  Recurrence right;
+  LeftRecurrence left;
+  int compared = 0, mismatch = 0;
+  for (int t = 0; t < 200; ++t) {
+    Perm v = random_perm(rng);
+    Perm u = walk_down(v, static_cast<int>(rng.below(8)) + 1, rng);
+    if (!bruhat(u, v) || u == v) continue;
+    const Poly a = right.get(u, v);
+    const Poly b = left.get(u, v);
+    const Poly c = right.get(inverse(u), inverse(v));
+    bool same = true;
+    for (int i = 0; i <= MAX_DEG; ++i)
+      if (a.a[i] != b.a[i] || a.a[i] != c.a[i]) same = false;
+    ++compared;
+    if (!same) ++mismatch;
+  }
+  const std::string lr = "left/right/inverse agreement on " + std::to_string(compared) + " S7 pairs";
+  expect(compared > 50 && mismatch == 0, lr.c_str());
+  expect(verify_s14() == 0, "S14 still verifies");
+  std::cout << "self-test " << (fails ? "FAILED" : "PASS") << '\n';
+  return fails ? 1 : 0;
+}
+
 static void usage() {
   throw std::runtime_error(
-      "usage: brenti_search --verify-s14 | --exhaustive N [--out FILE] [--checkpoint FILE] | "
-      "--eval U V | --flatten [--out FILE] | --explore [LIMIT] [--out FILE] | "
-      "--hunt [SAMPLES] [--out FILE] [--seed N]");
+      "usage: brenti_search --verify-s14 | --verify-h4 | --self-test |\n"
+      "                     --exhaustive N [--out FILE] [--checkpoint FILE] [--symmetry] |\n"
+      "                     --coxeter TYPE [--out FILE] |\n"
+      "                     --eval U V | --flatten [--out FILE] | --explore [LIMIT] [--out FILE] |\n"
+      "                     --hunt [SAMPLES] [--out FILE] [--seed N]\n"
+      "       TYPE is one of H3,H4,F4,B2,B3,B4,B5,ALL");
 }
 
 int main(int argc, char** argv) {
@@ -935,6 +1331,17 @@ int main(int argc, char** argv) {
     if (argc < 2) usage();
     const std::string cmd = argv[1];
     if (cmd == "--verify-s14" || cmd == "--verify-s14") return verify_s14();
+    if (cmd == "--verify-h4") return verify_h4();
+    if (cmd == "--self-test") return self_test();
+    if (cmd == "--coxeter") {
+      if (argc < 3) usage();
+      std::string output;
+      for (int i = 3; i < argc; ++i) {
+        if (std::string(argv[i]) == "--out" && i + 1 < argc) output = argv[++i];
+        else usage();
+      }
+      return coxeter_exhaustive(argv[2], output);
+    }
     if (cmd == "--eval") {
       if (argc < 4) usage();
       const Perm u = parse_perm(argv[2]);
@@ -988,13 +1395,15 @@ int main(int argc, char** argv) {
     if (n < 1 || n > MAX_N) throw std::runtime_error("N must be in 1..15");
     std::string output = "counterexamples.cert";
     std::string checkpoint;
+    bool symmetry = false;
     for (int i = 3; i < argc; ++i) {
       const std::string option = argv[i];
       if (option == "--out" && i + 1 < argc) output = argv[++i];
       else if (option == "--checkpoint" && i + 1 < argc) checkpoint = argv[++i];
+      else if (option == "--symmetry") symmetry = true;
       else throw std::runtime_error("bad option: " + option);
     }
-    return exhaustive(n, output, checkpoint);
+    return exhaustive(n, output, checkpoint, symmetry);
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << '\n';
     return 1;

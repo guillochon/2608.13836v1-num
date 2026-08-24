@@ -8,7 +8,7 @@ SRC := src/main.cpp
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+$(TARGET): $(SRC) src/coxeter.hpp
 	$(CXX) $(CXXFLAGS) $(OMP) -o $@ $< $(LDFLAGS)
 
 clean:

@@ -2,5 +2,6 @@ brenti_search
 brenti_search
 *.cert
 *.done
+*.log
 *:Zone.Identifier
 .DS_Store
